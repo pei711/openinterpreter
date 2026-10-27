@@ -25,6 +25,7 @@ pub(crate) struct ChatCompletionChunk {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
@@ -102,7 +103,6 @@ struct StreamState {
     tool_calls: Vec<PartialToolCall>,
     finalized_tool_call_count: usize,
     usage: Option<ChatUsage>,
-    server_model: Option<String>,
 }
 
 impl StreamState {
@@ -119,7 +119,6 @@ impl StreamState {
             tool_calls: Vec::new(),
             finalized_tool_call_count: 0,
             usage: None,
-            server_model: None,
         }
     }
 }
@@ -202,18 +201,6 @@ async fn process_chat_sse(
 
         if let Some(id) = chunk.id.clone() {
             state.response_id = id;
-        }
-        if let Some(model) = chunk.model.clone()
-            && state.server_model.as_deref() != Some(model.as_str())
-        {
-            state.server_model = Some(model.clone());
-            if tx_event
-                .send(Ok(ResponseEvent::ServerModel(model)))
-                .await
-                .is_err()
-            {
-                return;
-            }
         }
         if !state.created_sent {
             state.created_sent = true;
@@ -619,13 +606,9 @@ mod tests {
             events.push(event.expect("chat stream event"));
         }
 
+        assert!(matches!(&events[0], ResponseEvent::Created { .. }));
         assert!(matches!(
-            &events[0],
-            ResponseEvent::ServerModel(model) if model == "gpt-5.2-codex"
-        ));
-        assert!(matches!(&events[1], ResponseEvent::Created { .. }));
-        assert!(matches!(
-            &events[2],
+            &events[1],
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
                 id: None,
                 name,
@@ -643,7 +626,7 @@ mod tests {
                     .to_string()
         ));
         assert!(matches!(
-            events[3],
+            events[2],
             ResponseEvent::Completed {
                 response_id: _,
                 token_usage: None,
@@ -738,7 +721,7 @@ mod tests {
         }
 
         assert!(matches!(
-            &events[2],
+            &events[1],
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
                 name,
                 namespace: Some(namespace),
@@ -777,10 +760,6 @@ mod tests {
             tool_kinds,
         );
 
-        assert!(matches!(
-            stream.next().await.expect("server model").expect("event"),
-            ResponseEvent::ServerModel(_)
-        ));
         assert!(matches!(
             stream.next().await.expect("created").expect("event"),
             ResponseEvent::Created { .. }
@@ -833,15 +812,15 @@ mod tests {
         }
 
         assert!(matches!(
-            &events[2],
+            &events[1],
             ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { .. })
         ));
         assert!(matches!(
-            &events[3],
+            &events[2],
             ResponseEvent::ReasoningContentDelta { delta, .. } if delta == "think "
         ));
         assert!(matches!(
-            &events[4],
+            &events[3],
             ResponseEvent::ReasoningContentDelta { delta, .. } if delta == "again"
         ));
         assert!(events.iter().any(|event| matches!(
@@ -853,5 +832,34 @@ mod tests {
                 text: "think again".to_string(),
             }]
         )));
+    }
+
+    #[tokio::test]
+    async fn spawn_chat_stream_omits_server_model_for_routed_models() {
+        let tool_kinds = ToolKinds::default();
+        let sse = "\
+data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"claude-opus-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n\
+data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"claude-opus-5-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+        let mut stream = spawn_chat_stream(
+            Box::pin(futures::stream::once(async move { Ok(sse.into()) })),
+            Duration::from_secs(1),
+            /*telemetry*/ None,
+            tool_kinds,
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("chat stream event"));
+        }
+
+        assert!(matches!(&events[0], ResponseEvent::Created { .. }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ResponseEvent::ServerModel(_))),
+            "chat wire stream should not emit ResponseEvent::ServerModel, avoiding false cyber-activity warnings on routed models"
+        );
     }
 }
